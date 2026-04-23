@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "read_file|grep_search|run_shell_command",
+        "hooks": [
+          {
+            "name": "block-env",
+            "type": "command",
+            "command": "python .gemini/hooks/before-tool-block-env.py"
+          }
+        ]
+      }
+    ],
+    "AfterTool": [
+      {
+        "matcher": "write_file|replace",
+        "hooks": [
+          {
+            "name": "prettier",
+            "type": "command",
+            "command": "python .gemini/hooks/after-tool-prettier.py"
+          }
+        ]
+      }
+    ]
+  }
+}

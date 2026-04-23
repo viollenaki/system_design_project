@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "skills": [
+    {
+      "id": "commit-message",
+      "path": ".gemini/skills/commit-message",
+      "entry": "SKILL.md"
+    },
+    {
+      "id": "security-review",
+      "path": ".gemini/skills/security-review",
+      "entry": "SKILL.md"
+    }
+  ]
+}
