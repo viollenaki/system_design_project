@@ -15,7 +15,7 @@ graph TD
 
     subgraph Backend [FastAPI Server]
         CM[Connection Manager]
-        WS_Handler[WebSocket Endpoint /ws/{client_id}]
+        WS_Handler["WebSocket Endpoint /ws/{client_id}"]
     end
 
     UI -->|User Input| WS_Client
