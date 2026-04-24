@@ -39,3 +39,28 @@ class Token(BaseModel):
 
 class TokenData(BaseModel):
     phone: Optional[str] = None
+
+class GroupBase(BaseModel):
+    name: str
+
+class GroupCreate(GroupBase):
+    pass
+
+class GroupRead(GroupBase):
+    id: int
+    created_at: datetime
+    created_by: int
+
+    class Config:
+        orm_mode = True
+
+class GroupMemberBase(BaseModel):
+    group_id: int
+    user_id: int
+
+class GroupMemberRead(GroupMemberBase):
+    id: int
+    joined_at: datetime
+
+    class Config:
+        orm_mode = True

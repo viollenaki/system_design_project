@@ -1,15 +1,17 @@
 "use client";
 
 import { useState, useEffect, useRef, useMemo } from "react";
+import { motion, AnimatePresence } from "framer-motion";
 
 interface Message {
+  id?: string;
   from: number;
   message: string;
   timestamp: number;
 }
 
 interface ChatState {
-  [key: number]: Message[];
+  [key: string | number]: Message[];
 }
 
 interface User {
@@ -26,17 +28,26 @@ export default function ChatPage() {
   const [error, setError] = useState("");
 
   const [chats, setChats] = useState<ChatState>({});
+  const [readStatus, setReadStatus] = useState<Record<string, boolean>>({});
+  const [groups, setGroups] = useState<any[]>([]);
   const [activeUsers, setActiveUsers] = useState<number[]>([]);
-  const [selectedChat, setSelectedChat] = useState<number | null>(null);
-  const [unreadCounts, setUnreadCounts] = useState<Record<number, number>>({});
+  const [selectedChat, setSelectedChat] = useState<number | string | null>(
+    null,
+  );
+  const [unreadCounts, setUnreadCounts] = useState<
+    Record<number | string, number>
+  >({});
   const [searchQuery, setSearchQuery] = useState("");
   const [inputValue, setInputValue] = useState("");
   const socketRef = useRef<WebSocket | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Client-side hydration safety
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
   const clientId = user?.id;
 
-  // Authentication Handlers
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
@@ -56,7 +67,6 @@ export default function ChatPage() {
         setError("Account created! Please login.");
       } else {
         setToken(data.access_token);
-        // Get me
         const meRes = await fetch("http://localhost:80/me", {
           headers: { Authorization: `Bearer ${data.access_token}` },
         });
@@ -77,25 +87,38 @@ export default function ChatPage() {
     const socket = new WebSocket(wsUrl);
     socketRef.current = socket;
 
+    const heartbeatInterval = setInterval(() => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "ping" }));
+      }
+    }, 30000);
+
     socket.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
 
         if (data.type === "users_update") {
           setActiveUsers(data.users.filter((id: number) => id !== clientId));
-        } else if (data.type === "message") {
+        } else if (data.type === "read_receipt") {
+          if (data.message_id) {
+            setReadStatus((prev) => ({ ...prev, [data.message_id]: true }));
+          }
+        } else if (data.type === "message" || data.type === "group_message") {
           const fromId = data.from;
+          const isGroup = data.type === "group_message";
+          const targetChatId = isGroup
+            ? `group_${data.group_id}`
+            : fromId === clientId
+              ? data.to
+              : fromId;
 
-          // Fix: If fromId is me, the target bucket is the one we sent to (selectedChat)
-          // This ensures sent messages appear in the correct chat window
-          const targetChatId = fromId === clientId ? selectedChat : fromId;
-
-          if (targetChatId === null) return;
+          if (targetChatId === null || targetChatId === undefined) return;
 
           const newMessage: Message = {
+            id: data.id,
             from: fromId,
             message: data.message,
-            timestamp: Date.now(),
+            timestamp: data.timestamp || Date.now(),
           };
 
           setChats((prev) => ({
@@ -106,8 +129,24 @@ export default function ChatPage() {
           if (fromId !== clientId && targetChatId !== selectedChat) {
             setUnreadCounts((prev) => ({
               ...prev,
-              [fromId]: (prev[fromId] || 0) + 1,
+              [targetChatId]: (prev[targetChatId] || 0) + 1,
             }));
+          }
+
+          // Send read receipt
+          if (
+            data.type === "message" &&
+            fromId !== clientId &&
+            targetChatId === selectedChat &&
+            data.id
+          ) {
+            socket.send(
+              JSON.stringify({
+                type: "read_receipt",
+                to: fromId,
+                message_id: data.id,
+              }),
+            );
           }
         }
       } catch (err) {
@@ -116,11 +155,11 @@ export default function ChatPage() {
     };
 
     return () => {
+      clearInterval(heartbeatInterval);
       socket.close();
     };
   }, [clientId, selectedChat]);
 
-  // Auto-scroll to bottom of chat
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -131,50 +170,77 @@ export default function ChatPage() {
     return activeUsers.filter((id) => id.toString().includes(searchQuery));
   }, [activeUsers, searchQuery]);
 
-  const handleSelectChat = (id: number) => {
+  const handleSelectChat = async (id: number | string) => {
     setSelectedChat(id);
-    setUnreadCounts((prev) => ({
-      ...prev,
-      [id]: 0,
-    }));
+    setUnreadCounts((prev) => ({ ...prev, [id]: 0 }));
+
+    try {
+      const isGroup = typeof id === "string" && id.startsWith("group_");
+      const url = isGroup
+        ? `http://localhost:80/groups/${id.replace("group_", "")}/history`
+        : `http://localhost:80/history/${id}`;
+
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (response.ok) {
+        const history = await response.json();
+        setChats((prev) => ({
+          ...prev,
+          [id]: history,
+        }));
+      }
+    } catch (err) {
+      console.error("Failed to fetch history", err);
+    }
   };
 
   const sendMessage = (e: React.FormEvent) => {
     e.preventDefault();
-    if (socketRef.current && inputValue && selectedChat !== null && clientId) {
-      const payload = {
-        to: selectedChat,
-        message: inputValue,
-      };
+    if (
+      socketRef.current &&
+      inputValue.trim() &&
+      selectedChat !== null &&
+      clientId
+    ) {
+      const isGroup =
+        typeof selectedChat === "string" && selectedChat.startsWith("group_");
+      const payload = isGroup
+        ? {
+            type: "group_message",
+            group_id: parseInt(selectedChat.replace("group_", "")),
+            message: inputValue,
+          }
+        : { to: selectedChat, message: inputValue };
 
-      // Send via WS
       socketRef.current.send(JSON.stringify(payload));
-
-      // Locally add the message for the sender to avoid waiting for broadcast
-      // This combined with backend fix prevents duplication
-      const newMessage: Message = {
-        from: clientId,
-        message: inputValue,
-        timestamp: Date.now(),
-      };
-
-      setChats((prev) => ({
-        ...prev,
-        [selectedChat]: [...(prev[selectedChat] || []), newMessage],
-      }));
-
       setInputValue("");
     }
   };
 
+  if (!mounted) return null;
+
   if (!user) {
     return (
-      <div className="flex h-screen items-center justify-center bg-gray-100 p-4">
-        <div className="w-full max-w-md bg-white p-8 rounded-3xl shadow-xl shadow-gray-200">
-          <div className="flex flex-col items-center mb-8">
-            <div className="w-16 h-16 rounded-2xl bg-blue-600 flex items-center justify-center text-white shadow-lg mb-4">
+      <div className="relative flex h-screen items-center justify-center p-4 overflow-hidden">
+        <div className="mesh-gradient" />
+        <div className="bg-blob bg-blob-1" />
+        <div className="bg-blob bg-blob-2" />
+        <div className="bg-blob bg-blob-3" />
+
+        <motion.div
+          initial={{ opacity: 0, scale: 0.9, y: 20 }}
+          animate={{ opacity: 1, scale: 1, y: 0 }}
+          transition={{ duration: 0.5, ease: "easeOut" }}
+          className="w-full max-w-md glass-panel p-10 rounded-[2.5rem] relative z-10"
+        >
+          <div className="flex flex-col items-center mb-10">
+            <motion.div
+              whileHover={{ rotate: 12, scale: 1.1 }}
+              className="w-20 h-20 rounded-3xl bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white shadow-2xl shadow-blue-500/20 mb-6"
+            >
               <svg
-                className="w-8 h-8"
+                className="w-10 h-10"
                 fill="none"
                 stroke="currentColor"
                 viewBox="0 0 24 24"
@@ -182,22 +248,22 @@ export default function ChatPage() {
                 <path
                   strokeLinecap="round"
                   strokeLinejoin="round"
-                  strokeWidth={2}
+                  strokeWidth={2.5}
                   d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"
                 />
               </svg>
-            </div>
-            <h1 className="text-2xl font-bold">
-              {isRegistering ? "Create Account" : "Welcome Back"}
+            </motion.div>
+            <h1 className="text-4xl font-black text-white tracking-tight mb-2">
+              {isRegistering ? "Join Chat" : "Welcome"}
             </h1>
-            <p className="text-gray-500 text-sm mt-2">
-              Enter your details to continue
+            <p className="text-blue-200/60 text-sm font-medium">
+              Real-time Glassmorphism Chat
             </p>
           </div>
 
-          <form onSubmit={handleAuth} className="space-y-4">
-            <div>
-              <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">
+          <form onSubmit={handleAuth} className="space-y-6">
+            <div className="space-y-2">
+              <label className="text-[11px] font-bold text-blue-200/40 uppercase tracking-[0.2em] ml-1">
                 Phone Number
               </label>
               <input
@@ -205,12 +271,12 @@ export default function ChatPage() {
                 placeholder="+1 234 567 890"
                 value={phone}
                 onChange={(e) => setPhone(e.target.value)}
-                className="w-full px-4 py-3 bg-gray-50 border border-gray-100 rounded-xl focus:ring-2 focus:ring-blue-500 transition-all outline-none"
+                className="w-full px-6 py-4 glass-input rounded-2xl outline-none text-white font-medium placeholder:text-white/20"
                 required
               />
             </div>
-            <div>
-              <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">
+            <div className="space-y-2">
+              <label className="text-[11px] font-bold text-blue-200/40 uppercase tracking-[0.2em] ml-1">
                 Password
               </label>
               <input
@@ -218,48 +284,78 @@ export default function ChatPage() {
                 placeholder="••••••••"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                className="w-full px-4 py-3 bg-gray-50 border border-gray-100 rounded-xl focus:ring-2 focus:ring-blue-500 transition-all outline-none"
+                className="w-full px-6 py-4 glass-input rounded-2xl outline-none text-white font-medium placeholder:text-white/20"
                 required
               />
             </div>
-            {error && <p className="text-red-500 text-sm">{error}</p>}
-            <button
+            <AnimatePresence>
+              {error && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: "auto" }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="bg-red-500/20 text-red-200 px-4 py-3 rounded-xl text-xs font-bold border border-red-500/30 flex items-center gap-2"
+                >
+                  <svg
+                    className="w-4 h-4 shrink-0"
+                    fill="currentColor"
+                    viewBox="0 0 20 20"
+                  >
+                    <path
+                      fillRule="evenodd"
+                      d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z"
+                      clipRule="evenodd"
+                    />
+                  </svg>
+                  {error}
+                </motion.div>
+              )}
+            </AnimatePresence>
+            <motion.button
+              whileHover={{ scale: 1.02 }}
+              whileTap={{ scale: 0.98 }}
               type="submit"
-              className="w-full py-3 bg-blue-600 text-white font-bold rounded-xl hover:bg-blue-700 transition-all shadow-lg shadow-blue-100 mt-2"
+              className="w-full py-4 bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-black rounded-2xl shadow-xl shadow-blue-900/40 text-lg"
             >
-              {isRegistering ? "Register" : "Login"}
-            </button>
+              {isRegistering ? "Create Account" : "Sign In"}
+            </motion.button>
           </form>
 
-          <div className="mt-6 text-center">
+          <div className="mt-8 text-center">
             <button
               onClick={() => {
                 setIsRegistering(!isRegistering);
                 setError("");
               }}
-              className="text-sm font-medium text-blue-600 hover:text-blue-700"
+              className="text-sm font-bold text-blue-300 hover:text-white transition-colors"
             >
               {isRegistering
                 ? "Already have an account? Login"
-                : "Don't have an account? Register"}
+                : "New here? Create account"}
             </button>
           </div>
-        </div>
+        </motion.div>
       </div>
     );
   }
 
   return (
-    <main className="flex h-screen bg-white text-gray-900 overflow-hidden font-[family-name:var(--font-geist-sans)]">
+    <main className="flex h-screen bg-[#0f172a] text-white overflow-hidden relative font-sans">
+      <div className="mesh-gradient" />
+      <div className="bg-blob bg-blob-1 opacity-20" />
+      <div className="bg-blob bg-blob-2 opacity-20" />
+
       {/* Sidebar */}
-      <div
-        className={`${selectedChat !== null ? "hidden md:flex" : "flex"} w-full md:w-80 border-r bg-gray-50 flex-col shrink-0`}
+      <motion.div
+        initial={{ x: -100, opacity: 0 }}
+        animate={{ x: 0, opacity: 1 }}
+        className={`${selectedChat !== null ? "hidden md:flex" : "flex"} w-full md:w-[380px] glass-panel m-4 rounded-[2.5rem] flex-col shrink-0 overflow-hidden relative z-10`}
       >
-        <div className="p-6 border-b bg-white">
-          <div className="flex items-center gap-3 mb-6">
-            <div className="w-12 h-12 rounded-2xl bg-blue-600 flex items-center justify-center text-white shadow-lg shadow-blue-200">
+        <div className="p-8 border-b border-white/10">
+          <div className="flex items-center gap-4 mb-8">
+            <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white shadow-xl">
               <svg
-                className="w-6 h-6"
+                className="w-7 h-7"
                 fill="none"
                 stroke="currentColor"
                 viewBox="0 0 24 24"
@@ -272,9 +368,11 @@ export default function ChatPage() {
                 />
               </svg>
             </div>
-            <div className="flex-1">
-              <h1 className="font-bold text-xl tracking-tight">Messages</h1>
-              <p className="text-xs text-gray-500 font-medium truncate">
+            <div className="flex-1 min-w-0">
+              <h1 className="font-black text-2xl tracking-tight text-white">
+                Chats
+              </h1>
+              <p className="text-[10px] text-blue-300/50 font-black uppercase tracking-[0.2em] truncate">
                 {user.phone}
               </p>
             </div>
@@ -282,12 +380,12 @@ export default function ChatPage() {
               onClick={() => {
                 setUser(null);
                 setToken(null);
+                setSelectedChat(null);
               }}
-              className="p-2 text-gray-400 hover:text-red-500 transition-colors"
-              title="Logout"
+              className="p-3 bg-white/5 text-white/40 hover:text-red-400 hover:bg-red-400/10 rounded-2xl transition-all group"
             >
               <svg
-                className="w-5 h-5"
+                className="w-6 h-6 group-hover:scale-110 transition-transform"
                 fill="none"
                 stroke="currentColor"
                 viewBox="0 0 24 24"
@@ -302,10 +400,10 @@ export default function ChatPage() {
             </button>
           </div>
 
-          <div className="relative">
-            <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-400">
+          <div className="relative group">
+            <span className="absolute inset-y-0 left-0 pl-5 flex items-center text-white/20">
               <svg
-                className="h-4 w-4"
+                className="h-5 w-5"
                 fill="none"
                 stroke="currentColor"
                 viewBox="0 0 24 24"
@@ -313,85 +411,219 @@ export default function ChatPage() {
                 <path
                   strokeLinecap="round"
                   strokeLinejoin="round"
-                  strokeWidth={2}
+                  strokeWidth={2.5}
                   d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
                 />
               </svg>
             </span>
             <input
               type="text"
-              placeholder="Search users..."
+              placeholder="Search people..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-10 pr-4 py-2.5 bg-gray-100 border-none rounded-xl focus:ring-2 focus:ring-blue-500 text-sm transition-all outline-none"
+              className="w-full pl-12 pr-6 py-4 glass-input rounded-[1.5rem] text-sm font-medium outline-none placeholder:text-white/10"
             />
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto px-3 py-4 space-y-1">
-          {filteredUsers.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-40 text-center px-4">
-              <p className="text-gray-400 text-sm">No other users online yet</p>
-            </div>
-          ) : (
-            filteredUsers.map((userId) => (
-              <button
-                key={userId}
-                onClick={() => handleSelectChat(userId)}
-                className={`w-full p-3 flex items-center gap-4 rounded-xl transition-all ${
+        <div className="flex-1 overflow-y-auto px-4 py-6 space-y-2 scrollbar-none">
+          {filteredUsers.map((userId) => (
+            <motion.button
+              key={userId}
+              whileHover={{ scale: 1.02, x: 5 }}
+              whileTap={{ scale: 0.98 }}
+              onClick={() => handleSelectChat(userId)}
+              className={`w-full p-4 flex items-center gap-4 rounded-3xl transition-all relative group ${
+                selectedChat === userId
+                  ? "bg-blue-600/40 shadow-lg border border-blue-400/30"
+                  : "hover:bg-white/5 border border-transparent"
+              }`}
+            >
+              <div
+                className={`w-14 h-14 shrink-0 rounded-2xl flex items-center justify-center font-black text-xl shadow-inner ${
                   selectedChat === userId
-                    ? "bg-blue-600 text-white shadow-md shadow-blue-100"
-                    : "hover:bg-white text-gray-700"
+                    ? "bg-white text-blue-600"
+                    : "bg-white/5 text-blue-400"
                 }`}
               >
-                <div
-                  className={`w-12 h-12 shrink-0 rounded-full flex items-center justify-center font-bold text-lg ${
-                    selectedChat === userId
-                      ? "bg-white/20 text-white"
-                      : "bg-blue-100 text-blue-600"
-                  }`}
-                >
-                  {userId.toString().slice(-2)}
-                </div>
-                <div className="text-left flex-1 min-w-0">
-                  <div className="flex justify-between items-baseline mb-1">
-                    <span
-                      className={`font-semibold text-sm truncate ${selectedChat === userId ? "text-white" : "text-gray-900"}`}
+                {userId.toString().slice(-2)}
+              </div>
+              <div className="text-left flex-1 min-w-0">
+                <div className="flex justify-between items-baseline mb-1">
+                  <span className="font-bold text-base truncate text-white">
+                    User {userId}
+                  </span>
+                  {unreadCounts[userId] > 0 && (
+                    <motion.span
+                      initial={{ scale: 0 }}
+                      animate={{ scale: 1 }}
+                      className="bg-blue-500 text-white text-[10px] font-black px-2 py-1 rounded-lg shadow-lg"
                     >
-                      User #{userId}
-                    </span>
-                    {unreadCounts[userId] > 0 && (
-                      <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full min-w-[18px] text-center">
-                        {unreadCounts[userId]}
-                      </span>
-                    )}
-                  </div>
-                  <div
-                    className={`text-xs truncate ${selectedChat === userId ? "text-blue-100" : "text-gray-500"}`}
-                  >
-                    {chats[userId]?.slice(-1)[0]?.message ||
-                      "Start chatting..."}
-                  </div>
+                      {unreadCounts[userId]}
+                    </motion.span>
+                  )}
                 </div>
-              </button>
-            ))
-          )}
+                <div className="text-xs font-medium truncate text-blue-200/40">
+                  {chats[userId]?.slice(-1)[0]?.message || "Tap to chat"}
+                </div>
+              </div>
+            </motion.button>
+          ))}
         </div>
-      </div>
+      </motion.div>
 
       {/* Main Chat Area */}
-      <div
-        className={`${selectedChat === null ? "hidden md:flex" : "flex"} flex-1 flex flex-col bg-white relative`}
+      <motion.div
+        initial={{ opacity: 0, scale: 0.95 }}
+        animate={{ opacity: 1, scale: 1 }}
+        className={`${selectedChat === null ? "hidden md:flex" : "flex"} flex-1 flex flex-col glass-panel m-4 md:ml-0 rounded-[2.5rem] relative overflow-hidden z-10`}
       >
-        {selectedChat ? (
-          <>
-            <div className="h-[72px] px-6 border-b flex items-center gap-4 shrink-0 bg-white/80 backdrop-blur-md sticky top-0 z-10">
-              <button
-                onClick={() => setSelectedChat(null)}
-                className="md:hidden p-2 -ml-2 text-gray-500 hover:bg-gray-100 rounded-full"
+        <AnimatePresence mode="wait">
+          {selectedChat ? (
+            <motion.div
+              key="chat"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+              className="flex-1 flex flex-col h-full"
+            >
+              <div className="h-24 px-8 border-b border-white/10 flex items-center gap-5 shrink-0 bg-white/5 backdrop-blur-xl">
+                <button
+                  onClick={() => setSelectedChat(null)}
+                  className="md:hidden p-3 bg-white/5 text-white/40 rounded-2xl"
+                >
+                  <svg
+                    className="w-6 h-6"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2.5}
+                      d="M15 19l-7-7 7-7"
+                    />
+                  </svg>
+                </button>
+                <div className="w-14 h-14 rounded-2xl bg-white/10 flex items-center justify-center text-blue-400 font-black text-xl border border-white/10">
+                  {selectedChat.toString().slice(-2)}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <h2 className="font-black text-white text-xl tracking-tight">
+                    User #{selectedChat}
+                  </h2>
+                  <div className="flex items-center gap-2">
+                    <div className="h-2 w-2 rounded-full bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.5)]" />
+                    <span className="text-[10px] font-black text-green-400 uppercase tracking-widest">
+                      Active Now
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              <div
+                ref={scrollRef}
+                className="flex-1 overflow-y-auto p-8 space-y-8 scrollbar-none"
+              >
+                <AnimatePresence initial={false}>
+                  {(chats[selectedChat] || []).map((msg, idx) => {
+                    const isMe = msg.from === clientId;
+                    return (
+                      <motion.div
+                        key={msg.id || idx}
+                        initial={{ opacity: 0, y: 20, scale: 0.9 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        className={`flex ${isMe ? "justify-end" : "justify-start"}`}
+                      >
+                        <div
+                          className={`flex flex-col max-w-[80%] sm:max-w-[65%] ${isMe ? "items-end" : "items-start"}`}
+                        >
+                          <div
+                            className={`px-6 py-4 rounded-[2rem] text-sm font-medium leading-relaxed shadow-xl ${
+                              isMe
+                                ? "bg-gradient-to-br from-blue-600 to-indigo-700 text-white rounded-tr-none"
+                                : "glass-card text-white rounded-tl-none"
+                            }`}
+                          >
+                            {msg.message}
+                          </div>
+                          <span className="text-[10px] font-black text-white/20 mt-3 px-2 uppercase tracking-widest flex items-center gap-2">
+                            {new Date(msg.timestamp).toLocaleTimeString([], {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                            })}
+                            {isMe && msg.id && readStatus[msg.id] && (
+                              <span className="text-blue-400">✓ Read</span>
+                            )}
+                          </span>
+                        </div>
+                      </motion.div>
+                    );
+                  })}
+                </AnimatePresence>
+              </div>
+
+              <form onSubmit={sendMessage} className="p-8">
+                <div className="max-w-4xl mx-auto flex items-end gap-4 glass-card p-3 rounded-[2.5rem] border border-white/20">
+                  <textarea
+                    value={inputValue}
+                    onChange={(e) => setInputValue(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        sendMessage(e);
+                      }
+                    }}
+                    placeholder="Type a message..."
+                    rows={1}
+                    className="flex-1 px-5 py-4 bg-transparent border-none focus:ring-0 text-sm font-medium resize-none max-h-32 outline-none text-white placeholder:text-white/20"
+                  />
+                  <motion.button
+                    whileHover={{ scale: 1.05 }}
+                    whileTap={{ scale: 0.95 }}
+                    type="submit"
+                    disabled={!inputValue.trim()}
+                    className="bg-blue-600 text-white p-4 rounded-[1.5rem] disabled:opacity-20 shadow-lg shadow-blue-900/40"
+                  >
+                    <svg
+                      className="w-6 h-6 transform rotate-90"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2.5}
+                        d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"
+                      />
+                    </svg>
+                  </motion.button>
+                </div>
+              </form>
+            </motion.div>
+          ) : (
+            <motion.div
+              key="empty"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              className="flex-1 flex flex-col items-center justify-center p-12 text-center"
+            >
+              <motion.div
+                animate={{
+                  y: [0, -20, 0],
+                  rotate: [0, 5, -5, 0],
+                }}
+                transition={{
+                  duration: 6,
+                  repeat: Infinity,
+                  ease: "easeInOut",
+                }}
+                className="w-32 h-32 glass-card rounded-[2.5rem] flex items-center justify-center mb-10"
               >
                 <svg
-                  className="w-6 h-6"
+                  className="w-16 h-16 text-blue-400/30"
                   fill="none"
                   stroke="currentColor"
                   viewBox="0 0 24 24"
@@ -400,121 +632,20 @@ export default function ChatPage() {
                     strokeLinecap="round"
                     strokeLinejoin="round"
                     strokeWidth={2}
-                    d="M15 19l-7-7 7-7"
+                    d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
                   />
                 </svg>
-              </button>
-              <div className="w-10 h-10 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 font-bold">
-                {selectedChat.toString().slice(-2)}
-              </div>
-              <div className="flex-1">
-                <h2 className="font-bold text-gray-900 leading-tight">
-                  User #{selectedChat}
-                </h2>
-                <div className="flex items-center gap-1.5">
-                  <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
-                  <span className="text-[11px] font-medium text-gray-500 uppercase tracking-wider">
-                    Online
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            <div
-              ref={scrollRef}
-              className="flex-1 overflow-y-auto p-6 space-y-6 scroll-smooth bg-white"
-            >
-              {(chats[selectedChat] || []).map((msg, idx) => {
-                const isMe = msg.from === clientId;
-                return (
-                  <div
-                    key={idx}
-                    className={`flex ${isMe ? "justify-end" : "justify-start"}`}
-                  >
-                    <div
-                      className={`flex flex-col max-w-[80%] md:max-w-[70%] ${isMe ? "items-end" : "items-start"}`}
-                    >
-                      <div
-                        className={`px-4 py-2.5 rounded-2xl text-sm leading-relaxed ${
-                          isMe
-                            ? "bg-blue-600 text-white rounded-tr-none shadow-md shadow-blue-100"
-                            : "bg-gray-100 text-gray-800 rounded-tl-none"
-                        }`}
-                      >
-                        {msg.message}
-                      </div>
-                      <span className="text-[10px] text-gray-400 mt-1 px-1">
-                        {new Date(msg.timestamp).toLocaleTimeString([], {
-                          hour: "2-digit",
-                          minute: "2-digit",
-                        })}
-                      </span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-
-            <form
-              onSubmit={sendMessage}
-              className="p-4 md:p-6 bg-white border-t border-gray-100"
-            >
-              <div className="flex items-center gap-3 bg-gray-50 p-1.5 rounded-2xl border border-gray-100 focus-within:border-blue-300 focus-within:ring-4 focus-within:ring-blue-500/5 transition-all">
-                <input
-                  type="text"
-                  value={inputValue}
-                  onChange={(e) => setInputValue(e.target.value)}
-                  placeholder="Type a message..."
-                  className="flex-1 px-4 py-2 bg-transparent border-none focus:ring-0 text-sm outline-none"
-                />
-                <button
-                  type="submit"
-                  disabled={!inputValue.trim()}
-                  className="bg-blue-600 text-white p-2.5 rounded-xl hover:bg-blue-700 transition-all disabled:opacity-40 shadow-md shadow-blue-200"
-                >
-                  <svg
-                    className="w-5 h-5 transform rotate-90"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"
-                    />
-                  </svg>
-                </button>
-              </div>
-            </form>
-          </>
-        ) : (
-          <div className="flex-1 flex flex-col items-center justify-center bg-gray-50/50 p-12 text-center">
-            <div className="w-24 h-24 bg-white rounded-3xl shadow-xl shadow-gray-200/50 flex items-center justify-center mb-8">
-              <svg
-                className="w-12 h-12 text-blue-500 opacity-20"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
-                />
-              </svg>
-            </div>
-            <h3 className="text-xl font-bold text-gray-900 mb-2">
-              No Chat Selected
-            </h3>
-            <p className="text-gray-500 max-w-xs mx-auto text-sm leading-relaxed">
-              Select a user from the sidebar to start a conversation.
-            </p>
-          </div>
-        )}
-      </div>
+              </motion.div>
+              <h3 className="text-4xl font-black text-white mb-4 tracking-tight">
+                Select a Chat
+              </h3>
+              <p className="text-blue-200/40 max-w-sm mx-auto text-lg font-medium">
+                Start a secure, real-time conversation now.
+              </p>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </motion.div>
     </main>
   );
 }
