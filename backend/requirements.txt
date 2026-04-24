@@ -1,3 +1,10 @@
 fastapi
 uvicorn
 websockets
+sqlalchemy
+passlib[bcrypt]
+python-jose[cryptography]
+slowapi
+redis
+pydantic-settings
+python-multipart
